@@ -1,22 +1,13 @@
 import os
-import sys
 import argparse
 import json
-import re
 from tqdm import tqdm
-import numpy as np
 from time import strftime, gmtime
 import logging
 
 import torch
-import torch.nn.functional as F
-import torch.nn as nn
-from torch.nn import BCELoss
 from torch.utils.data import DataLoader, SequentialSampler
-from transformers import AdamW, get_linear_schedule_with_warmup
-
-import transformers
-from transformers import BertForNextSentencePrediction, BertTokenizer, BertModel
+from transformers import BertTokenizer, BertModel, AdamW, get_linear_schedule_with_warmup
 
 
 class DatasetForBert(torch.utils.data.Dataset):
@@ -246,10 +237,10 @@ def train(args, model, tokenizer, training_data, logger):
         # torch.Size([5, 2, 3])
         # 下面batch不变，词向量取反顺序以算matmul，然后squeeze掉单维度
         score = torch.matmul(sent1_vec.unsqueeze(1), sent2_vec.unsqueeze(1).permute(0, 2, 1)).squeeze(-1).squeeze(-1)
-        logits = nn.Sigmoid()(score)
+        logits = torch.nn.Sigmoid()(score)
 
         # 计算cross entropy
-        loss_fct = nn.BCELoss()
+        loss_fct = torch.nn.BCELoss()
         loss = loss_fct(logits, labels)
 
         if args.n_gpu > 1:
