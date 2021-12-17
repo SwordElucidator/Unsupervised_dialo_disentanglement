@@ -17,7 +17,6 @@ from transformers import AdamW, get_linear_schedule_with_warmup
 
 import transformers
 from transformers import BertForNextSentencePrediction, BertTokenizer, BertModel
-import apex
 
 
 class DatasetForBert(torch.utils.data.Dataset):
@@ -29,20 +28,20 @@ class DatasetForBert(torch.utils.data.Dataset):
         self.max_source_len = max_source_len
         self.max_seq_len = max_seq_len
         self.offset = offset
-        self.cls_id = cls_id
-        self.sep_id = sep_id
-        self.pad_id = pad_id
-        self.mask_id = mask_id
+
+        # The first token of every sequence is always a special classification token ([CLS]). The final hidden state
+        # corresponding to this token is used as the aggregate sequence representation for classification tasks.
+        self.cls_id = cls_id  # token for classification
+        self.sep_id = sep_id  # token for sentence separation
+        self.pad_id = pad_id  # token for padding
+        self.mask_id = mask_id  # token for mask
         self.num_training_instances = num_training_instances
 
     def __len__(self):
         return int(self.num_training_instances)
 
     def __trunk(self, ids, max_len):
-        if len(ids) > max_len - 1:
-            ids = ids[:max_len - 1]
-        ids = ids + [self.sep_id]
-        return ids
+        return ids[:max_len - 1] + [self.sep_id]
 
     def __pad(self, ids, max_len):
         if len(ids) < max_len:
@@ -55,10 +54,11 @@ class DatasetForBert(torch.utils.data.Dataset):
         idx = (self.offset + idx) % len(self.features)
         feature = self.features[idx]
 
+        # for each feature, a sentence1 and a sentence2 are trucked, then add [cls] at first and [seg] in the last
         source_id_1 = self.__trunk([self.cls_id] + feature["sent1"], self.max_source_len)
-        segment_id_1 = [0] * len(source_id_1) + [0] * (self.max_source_len - len(source_id_1))
-        input_mask_1 = [1] * len(source_id_1) + [0] * (self.max_source_len - len(source_id_1))
-        input_id_1 = self.__pad(source_id_1, self.max_source_len)
+        segment_id_1 = [0] * len(source_id_1) + [0] * (self.max_source_len - len(source_id_1))  # segment
+        input_mask_1 = [1] * len(source_id_1) + [0] * (self.max_source_len - len(source_id_1))  # mask
+        input_id_1 = self.__pad(source_id_1, self.max_source_len)  # padded sentence
 
         source_id_2 = self.__trunk([self.cls_id] + feature["sent2"], self.max_source_len)
         segment_id_2 = [0] * len(source_id_2) + [0] * (self.max_source_len - len(source_id_2))
@@ -113,11 +113,13 @@ def prepare_for_training(args, model, checkpoint_state_dict, amp=None):
     ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
 
+    # initialize amp if fp16 is used
     if amp:
         model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
         if checkpoint_state_dict:
             amp.load_state_dict(checkpoint_state_dict['amp'])
 
+    # load check state if exist
     if checkpoint_state_dict:
         optimizer.load_state_dict(checkpoint_state_dict['optimizer'])
         model.load_state_dict(checkpoint_state_dict['model'])
@@ -147,7 +149,7 @@ def train(args, model, tokenizer, training_data, logger):
     else:
         amp = None
 
-    checkpoint_state_dict = None
+    checkpoint_state_dict = {}
 
     # set the device
     model.to(args.device)
@@ -205,6 +207,7 @@ def train(args, model, tokenizer, training_data, logger):
     train_iterator = tqdm(
         train_dataloader, initial=global_step,
         desc="Iter (loss=X.XXX, lr=X.XXXXXXX)", disable=False)
+    # tqdm is a iterator generator for making progress bar
 
     model.train()
     model.zero_grad()
@@ -214,25 +217,38 @@ def train(args, model, tokenizer, training_data, logger):
     for step, batch in enumerate(train_iterator):
         batch = tuple(t.to(args.device) for t in batch)
         labels = batch[6]
-        inputs_1 = {'input_ids': batch[0],
-                    'attention_mask': batch[1],
-                    }
+
+        inputs_1 = {'input_ids': batch[0], 'attention_mask': batch[1]}
         if args.model_config.startswith('bert'):
             inputs_1['token_type_ids'] = batch[2]
-
         sent1_vec = model(**inputs_1)[1]
 
-        inputs_2 = {'input_ids': batch[3],
-                    'attention_mask': batch[4],
-                    }
+        inputs_2 = {'input_ids': batch[3], 'attention_mask': batch[4]}
         if args.model_config.startswith('bert'):
             inputs_2['token_type_ids'] = batch[5]
-
         sent2_vec = model(**inputs_2)[1]
 
+        # 对于上述两个向量，根据算法，sigmoid(v1 · v2)
+
+        # unsqueeze: Returns a new tensor with a dimension of size one inserted at the specified position
+        # >>> x = torch.tensor([1, 2, 3, 4])
+        # >>> torch.unsqueeze(x, 1)
+        # tensor([[ 1],
+        #         [ 2],
+        #         [ 3],
+        #         [ 4]])
+
+        # permute  矩阵置换: Returns a view of the original tensor input with its dimensions permuted
+        # >>> x = torch.randn(2, 3, 5)
+        # >>> x.size()
+        # torch.Size([2, 3, 5])
+        # >>> x.permute((2, 0, 1)).size()
+        # torch.Size([5, 2, 3])
+        # 下面batch不变，词向量取反顺序以算matmul，然后squeeze掉单维度
         score = torch.matmul(sent1_vec.unsqueeze(1), sent2_vec.unsqueeze(1).permute(0, 2, 1)).squeeze(-1).squeeze(-1)
         logits = nn.Sigmoid()(score)
 
+        # 计算cross entropy
         loss_fct = nn.BCELoss()
         loss = loss_fct(logits, labels)
 
@@ -305,6 +321,7 @@ def prepare(args):
     args.device = device
 
     if args.fp16:  # use Half-precision floating-point format
+        import apex
         try:
             # use NVIDIA APEX
             apex.amp.register_half_function(torch, 'einsum')
